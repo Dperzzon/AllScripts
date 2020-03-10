@@ -1,0 +1,157 @@
+#Register feature#
+Register-AzProviderFeature -FeatureName VirtualMachineTemplatePreview -ProviderNamespace Microsoft.VirtualMachineImages
+
+#Verify feature registration#
+Get-AzProviderFeature -FeatureName VirtualMachineTemplatePreview -ProviderNamespace Microsoft.VirtualMachineImages
+
+#Check Provider Status, all need to be registred#
+Get-AzResourceProvider -ProviderNamespace Microsoft.VirtualMachineImages | Format-table -Property ResourceTypes,RegistrationState
+Get-AzResourceProvider -ProviderNamespace Microsoft.Storage | Format-table -Property ResourceTypes,RegistrationState 
+Get-AzResourceProvider -ProviderNamespace Microsoft.Compute | Format-table -Property ResourceTypes,RegistrationState
+Get-AzResourceProvider -ProviderNamespace Microsoft.KeyVault | Format-table -Property ResourceTypes,RegistrationState
+
+#If they dont return registred, run this#
+Register-AzResourceProvider -ProviderNamespace Microsoft.VirtualMachineImages
+Register-AzResourceProvider -ProviderNamespace Microsoft.Storage
+Register-AzResourceProvider -ProviderNamespace Microsoft.Compute
+Register-AzResourceProvider -ProviderNamespace Microsoft.KeyVault
+
+#Create Variables#
+# Get existing context
+$currentAzContext = Get-AzContext
+
+# Get your current subscription ID. 
+$subscriptionID=$currentAzContext.Subscription.Id
+
+# Destination image resource group
+$imageResourceGroup="aibwindp"
+
+# Location
+$location="westus"
+
+# Image distribution metadata reference name
+$runOutputName="aibCustWinManImg02dp"
+
+# Image template name
+$imageTemplateName="dpibtemplatetest"
+
+# Distribution properties object name (runOutput).
+# This gives you the properties of the managed image on completion.
+$runOutputName="winclientR01"
+
+#Create RG and set Role#
+New-AzResourceGroup `
+   -Name $imageResourceGroup `
+   -Location $location
+New-AzRoleAssignment `
+   -ObjectId ef511139-6170-438e-a6e1-763dc31bdf74 `
+   -Scope /subscriptions/$subscriptionID/resourceGroups/$imageResourceGroup `
+   -RoleDefinitionName Contributor
+   
+#Create shared image gallery#
+# Image gallery name
+$dpGalleryName= "myIBdp"
+
+# Image definition name
+$imageDefName ="winSvrimage"
+
+# additional replication region
+$replRegion2="eastus"
+
+# Create the gallery
+New-AzGallery `
+   -GalleryName $dpGalleryName `
+   -ResourceGroupName $imageResourceGroup  `
+   -Location $location
+
+# Create the image definition
+New-AzGalleryImageDefinition `
+   -GalleryName $dpGalleryName `
+   -ResourceGroupName $imageResourceGroup `
+   -Location $location `
+   -Name $imageDefName `
+   -OsState generalized `
+   -OsType Windows `
+   -Publisher 'myCompany' `
+   -Offer 'WindowsServer' `
+   -Sku 'WinSrv2019'
+   
+   #Download and config the template#
+   $templateFilePath = "armTemplateWinSIG.json"
+
+Invoke-WebRequest `
+   -Uri "https://raw.githubusercontent.com/danielsollondon/azvmimagebuilder/master/quickquickstarts/1_Creating_a_Custom_Win_Shared_Image_Gallery_Image/armTemplateWinSIG.json" `
+   -OutFile $templateFilePath `
+   -UseBasicParsing
+
+(Get-Content -path $templateFilePath -Raw ) `
+   -replace '<subscriptionID>',$subscriptionID | Set-Content -Path $templateFilePath
+(Get-Content -path $templateFilePath -Raw ) `
+   -replace '<rgName>',$imageResourceGroup | Set-Content -Path $templateFilePath
+(Get-Content -path $templateFilePath -Raw ) `
+   -replace '<runOutputName>',$runOutputName | Set-Content -Path $templateFilePath
+(Get-Content -path $templateFilePath -Raw ) `
+   -replace '<imageDefName>',$imageDefName | Set-Content -Path $templateFilePath
+(Get-Content -path $templateFilePath -Raw ) `
+   -replace '<sharedImageGalName>',$sigGalleryName | Set-Content -Path $templateFilePath
+(Get-Content -path $templateFilePath -Raw ) `
+   -replace '<region1>',$location | Set-Content -Path $templateFilePath
+(Get-Content -path $templateFilePath -Raw ) `
+   -replace '<region2>',$replRegion2 | Set-Content -Path $templateFilePath
+   
+   #Create Image version#
+   New-AzResourceGroupDeployment `
+   -ResourceGroupName $imageResourceGroup `
+   -TemplateFile $templateFilePath `
+   -api-version "2019-05-01-preview" `
+   -imageTemplateName $imageTemplateName `
+   -svclocation $location
+   
+   #Run/Build the image#
+   Invoke-AzResourceAction `
+   -ResourceName $imageTemplateName `
+   -ResourceGroupName $imageResourceGroup `
+   -ResourceType Microsoft.VirtualMachineImages/imageTemplates `
+   -ApiVersion "2019-05-01-preview" `
+   -Action Run
+   
+   #CREATE THE IMAGE on VM#
+   $imageVersion = Get-AzGalleryImageVersion `
+   -ResourceGroupName $imageResourceGroup `
+   -GalleryName $sigGalleryName `
+   -GalleryImageDefinitionName $imageDefName
+   
+   $vmResourceGroup = "myResourceGroup"
+$vmName = "myVMfromImage"
+
+# Create user object
+$cred = Get-Credential -Message "Enter a username and password for the virtual machine."
+
+# Create a resource group
+New-AzResourceGroup -Name $vmResourceGroup -Location $replRegion2
+
+# Network pieces
+$subnetConfig = New-AzVirtualNetworkSubnetConfig -Name mySubnet -AddressPrefix 192.168.1.0/24
+$vnet = New-AzVirtualNetwork -ResourceGroupName $vmResourceGroup -Location $replRegion2 `
+  -Name MYvNET -AddressPrefix 192.168.0.0/16 -Subnet $subnetConfig
+$pip = New-AzPublicIpAddress -ResourceGroupName $vmResourceGroup -Location $replRegion2 `
+  -Name "mypublicdns$(Get-Random)" -AllocationMethod Static -IdleTimeoutInMinutes 4
+$nsgRuleRDP = New-AzNetworkSecurityRuleConfig -Name myNetworkSecurityGroupRuleRDP  -Protocol Tcp `
+  -Direction Inbound -Priority 1000 -SourceAddressPrefix * -SourcePortRange * -DestinationAddressPrefix * `
+  -DestinationPortRange 3389 -Access Allow
+$nsg = New-AzNetworkSecurityGroup -ResourceGroupName $vmResourceGroup -Location $replRegion2 `
+  -Name myNetworkSecurityGroup -SecurityRules $nsgRuleRDP
+$nic = New-AzNetworkInterface -Name myNic -ResourceGroupName $vmResourceGroup -Location $replRegion2 `
+  -SubnetId $vnet.Subnets[0].Id -PublicIpAddressId $pip.Id -NetworkSecurityGroupId $nsg.Id
+
+# Create a virtual machine configuration using $imageVersion.Id to specify the shared image
+$vmConfig = New-AzVMConfig -VMName $vmName -VMSize Standard_D1_v2 | `
+Set-AzVMOperatingSystem -Windows -ComputerName $vmName -Credential $cred | `
+Set-AzVMSourceImage -Id $imageVersion.Id | `
+Add-AzVMNetworkInterface -Id $nic.Id
+
+# Create a virtual machine
+New-AzVM -ResourceGroupName $vmResourceGroup -Location $replRegion2 -VM $vmConfig
+
+#Verify#
+dir c:\
